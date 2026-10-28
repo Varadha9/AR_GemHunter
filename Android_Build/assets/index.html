@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AR Gem Hunter</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        body { overflow: hidden; background: #000; width: 100vw; height: 100vh; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        
+        #camera-video {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1;
+        }
+        #webgl-canvas {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; pointer-events: auto;
+        }
+
+        /* Top HUD */
+        .hud-top {
+            position: absolute; top: 20px; left: 0; right: 0;
+            padding: 0 24px; display: flex; justify-content: space-between; align-items: center;
+            z-index: 10; pointer-events: none;
+        }
+        .hud-badge {
+            background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(8px);
+            padding: 10px 18px; border-radius: 20px; border: 1px solid rgba(255,255,255,0.15);
+            color: #fff; font-size: 18px; font-weight: 700; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+        }
+        .timer-badge { color: #facc15; }
+
+        /* Instruction prompt */
+        .instruction-prompt {
+            position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+            background: rgba(15, 23, 42, 0.75); backdrop-filter: blur(6px);
+            color: #e2e8f0; font-size: 14px; padding: 8px 20px; border-radius: 20px;
+            z-index: 10; pointer-events: none; border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        /* Game Over Modal */
+        #gameover-modal {
+            display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(11, 15, 25, 0.92); backdrop-filter: blur(12px);
+            z-index: 20; flex-direction: column; justify-content: center; align-items: center;
+            color: #fff; text-align: center; padding: 24px;
+        }
+        #gameover-modal.active { display: flex; }
+        .modal-title { font-size: 34px; font-weight: 800; color: #ef4444; margin-bottom: 8px; }
+        .modal-score { font-size: 26px; font-weight: 700; color: #f8fafc; margin-bottom: 24px; }
+        .btn-restart {
+            background: #22c55e; color: #fff; font-size: 18px; font-weight: 700;
+            padding: 14px 40px; border: none; border-radius: 30px; cursor: pointer;
+            box-shadow: 0 8px 24px rgba(34, 197, 94, 0.4); transition: transform 0.1s;
+        }
+        .btn-restart:active { transform: scale(0.96); }
+
+        /* Floating Score Animation */
+        .floating-score {
+            position: absolute; color: #facc15; font-size: 24px; font-weight: 800;
+            z-index: 15; pointer-events: none; animation: floatUp 0.8s forwards ease-out;
+            text-shadow: 0 2px 8px rgba(0,0,0,0.8);
+        }
+        @keyframes floatUp {
+            0% { opacity: 1; transform: translate(-50%, -50%) scale(0.8); }
+            50% { transform: translate(-50%, -90%) scale(1.2); }
+            100% { opacity: 0; transform: translate(-50%, -130%) scale(1); }
+        }
+    </style>
+</head>
+<body>
+    <video id="camera-video" autoplay playsinline muted></video>
+    <canvas id="webgl-canvas"></canvas>
+
+    <!-- In-Game AR HUD -->
+    <div class="hud-top">
+        <div class="hud-badge" id="score-display">Score: 0</div>
+        <div class="hud-badge timer-badge" id="timer-display">Time: 60s</div>
+    </div>
+    <div class="instruction-prompt">Tap gems on screen to collect!</div>
+
+    <!-- Game Over Screen -->
+    <div id="gameover-modal">
+        <div class="modal-title">ROUND FINISHED!</div>
+        <div class="modal-score" id="final-score-display">Final Score: 0</div>
+        <button class="btn-restart" id="btn-restart" onclick="restartGame()">Play Again</button>
+    </div>
+
+    <script src="three.min.js"></script>
+    <script>
+        // --- 1. Camera Video Setup ---
+        const video = document.getElementById('camera-video');
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            navigator.mediaDevices.getUserMedia({
+                video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }
+            }).then(stream => {
+                video.srcObject = stream;
+                video.play();
+            }).catch(err => {
+                console.log("Camera access fallback to dark room AR simulation");
+            });
+        }
+
+        // --- 2. Web Audio Synthesizer (Chime effect on collect) ---
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        function playChime() {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(880, audioCtx.currentTime); // A5
+            osc.frequency.exponentialRampToValueAtTime(1760, audioCtx.currentTime + 0.15); // A6
+            gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.25);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.25);
+        }
+
+        // --- 3. Three.js Scene Setup ---
+        const canvas = document.getElementById('webgl-canvas');
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ canvas: canvas, alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 1.2);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xfffaed, 2.0);
+        dirLight.position.set(3, 5, 2);
+        scene.add(dirLight);
+
+        // --- 4. Object Pooling Pattern (10 Pre-allocated 3D Gems) ---
+        const POOL_SIZE = 10;
+        const MAX_ACTIVE = 5;
+        const gemPool = [];
+        const activeGems = [];
+
+        // Low-poly Faceted Diamond Material & Geometry
+        const gemGeometry = new THREE.IcosahedronGeometry(0.35, 0); // Faceted low poly
+        const gemMaterial = new THREE.MeshStandardMaterial({
+            color: 0xffd700,
+            metalness: 0.85,
+            roughness: 0.15,
+            flatShading: true
+        });
+
+        for (let i = 0; i < POOL_SIZE; i++) {
+            const mesh = new THREE.Mesh(gemGeometry, gemMaterial);
+            mesh.visible = false;
+            scene.add(mesh);
+            gemPool.push(mesh);
+        }
+
+        function spawnGem() {
+            if (gemPool.length === 0 || activeGems.length >= MAX_ACTIVE) return;
+            const gem = gemPool.pop();
+            
+            // Random position in 3D AR field in front of camera
+            const x = (Math.random() - 0.5) * 4.0;
+            const y = (Math.random() - 0.5) * 3.0;
+            const z = -(Math.random() * 2.5 + 1.5); // 1.5m to 4m in front
+
+            gem.position.set(x, y, z);
+            gem.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, 0);
+            gem.visible = true;
+            activeGems.push(gem);
+        }
+
+        function recycleGem(gem) {
+            gem.visible = false;
+            const idx = activeGems.indexOf(gem);
+            if (idx > -1) activeGems.splice(idx, 1);
+            gemPool.push(gem);
+        }
+
+        // --- 5. Game Loop & Scoring System ---
+        let score = 0;
+        let timeRemaining = 60;
+        let isGameActive = true;
+
+        const scoreDisplay = document.getElementById('score-display');
+        const timerDisplay = document.getElementById('timer-display');
+        const modal = document.getElementById('gameover-modal');
+        const finalScoreDisplay = document.getElementById('final-score-display');
+
+        function startGame() {
+            score = 0;
+            timeRemaining = 60;
+            isGameActive = true;
+            scoreDisplay.textContent = `Score: ${score}`;
+            timerDisplay.textContent = `Time: ${timeRemaining}s`;
+            modal.classList.remove('active');
+
+            // Recycle any lingering gems
+            while (activeGems.length > 0) {
+                recycleGem(activeGems[0]);
+            }
+
+            // Spawn initial 5 gems
+            for (let i = 0; i < MAX_ACTIVE; i++) {
+                spawnGem();
+            }
+        }
+
+        function restartGame() {
+            startGame();
+        }
+
+        // Countdown timer tick every second
+        setInterval(() => {
+            if (!isGameActive) return;
+            timeRemaining--;
+            if (timeRemaining <= 0) {
+                timeRemaining = 0;
+                endGame();
+            }
+            timerDisplay.textContent = `Time: ${timeRemaining}s`;
+        }, 1000);
+
+        function endGame() {
+            isGameActive = false;
+            modal.classList.add('active');
+            finalScoreDisplay.textContent = `Final Score: ${score}`;
+        }
+
+        // --- 6. Raycast Touch / Tap Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        function handleTap(event) {
+            if (!isGameActive) return;
+
+            const clientX = event.touches ? event.touches[0].clientX : event.clientX;
+            const clientY = event.touches ? event.touches[0].clientY : event.clientY;
+
+            mouse.x = (clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(activeGems);
+
+            if (intersects.length > 0) {
+                const hitGem = intersects[0].object;
+                
+                // Add score
+                score += 10;
+                scoreDisplay.textContent = `Score: ${score}`;
+                playChime();
+
+                // Spawn floating popup effect
+                showFloatingText("+10", clientX, clientY);
+
+                // Recycle and immediately spawn new gem
+                recycleGem(hitGem);
+                setTimeout(spawnGem, 200);
+            }
+        }
+
+        function showFloatingText(text, x, y) {
+            const el = document.createElement('div');
+            el.className = 'floating-score';
+            el.textContent = text;
+            el.style.left = `${x}px`;
+            el.style.top = `${y}px`;
+            document.body.appendChild(el);
+            setTimeout(() => el.remove(), 800);
+        }
+
+        window.addEventListener('touchstart', handleTap, { passive: true });
+        window.addEventListener('mousedown', handleTap);
+
+        // --- 7. Gyroscope / Device Orientation Support ---
+        window.addEventListener('deviceorientation', (e) => {
+            if (e.alpha !== null && e.beta !== null && e.gamma !== null) {
+                const beta = (e.beta - 45) * (Math.PI / 180) * 0.4;
+                const gamma = e.gamma * (Math.PI / 180) * 0.4;
+                camera.rotation.x = beta;
+                camera.rotation.y = gamma;
+            }
+        });
+
+        // --- 8. Render Animation Loop (Locked 60 FPS) ---
+        let lastTime = 0;
+        function animate(timestamp) {
+            requestAnimationFrame(animate);
+
+            // Rotate all active gems
+            for (let i = 0; i < activeGems.length; i++) {
+                activeGems[i].rotation.y += 0.02;
+                activeGems[i].rotation.x += 0.01;
+            }
+
+            // Ensure 5 active gems maintained
+            if (isGameActive && activeGems.length < MAX_ACTIVE) {
+                spawnGem();
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        startGame();
+        requestAnimationFrame(animate);
+    </script>
+</body>
+</html>
